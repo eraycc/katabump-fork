@@ -5,35 +5,43 @@ on:
     # 每天 UTC 0点 (北京时间 8点) 运行
     - cron: '0 0 * * *'
   workflow_dispatch: # 允许手动触发
+  # 只在 main 分支的 push 触发（排除日志分支）
+  push:
+    branches:
+      - main
 
 jobs:
   renew:
     runs-on: ubuntu-latest
-    
+    # 防止日志分支的 push 触发（双重保险）
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write  # 允许 push
+
     steps:
     - uses: actions/checkout@v4
-    
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0  # 需要所有分支历史
+
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
         node-version: '20'
-        
+
     - name: Install Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install -y xvfb
         npm install
         npx playwright install-deps chrome
-      
+
     - name: Run Renew Script
       env:
-        # 将 USERS_JSON 配置在 GitHub Repository Secrets 中
-        # 格式: [{"username": "xxx", "password": "xxx"}, ...]
         USERS_JSON: ${{ secrets.USERS_JSON }}
         HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-      # 使用 xvfb-run 模拟有头环境运行
       run: xvfb-run --auto-servernum --server-args="-screen 0 1280x720x24" node action_renew.js
 
     - name: Upload Screenshots
@@ -42,3 +50,36 @@ jobs:
       with:
         name: screenshots
         path: screenshots/
+
+    # ===== 🆕 新增：记录执行日志并 push =====
+    - name: Update action log
+      if: always()  # 无论成功失败都记录
+      run: |
+        # 配置 git
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        # 生成日志文件
+        RUN_STATUS="${{ job.status }}"
+        cat > action_cache.json << EOF
+        {
+          "last_run": "$(date -Iseconds)",
+          "run_id": "${{ github.run_id }}",
+          "run_number": "${{ github.run_number }}",
+          "status": "$RUN_STATUS",
+          "commit": "${{ github.sha }}",
+          "trigger": "${{ github.event_name }}"
+        }
+        EOF
+
+        # 切换到日志分支（不存在则创建）
+        git checkout action-log 2>/dev/null || git checkout -b action-log
+
+        # 如果日志分支落后于 main，合并（避免后续冲突）
+        git pull origin main --no-rebase --allow-unrelated-histories -X ours || true
+
+        # 复制日志文件并提交
+        cp action_cache.json .
+        git add action_cache.json
+        git commit -m "chore: update action log from run #${{ github.run_number }}" || echo "No changes to commit"
+        git push origin action-log
